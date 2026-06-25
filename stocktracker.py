@@ -5,42 +5,44 @@ import pandas as pd
 st.set_page_config(layout="centered", page_title="T212 Auto-Screener")
 st.title("🇬🇧 T212 Automated Stock Screener")
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour to keep it ultra-fast
+@st.cache_data(ttl=3600)  # Caches the watchlists for 1 hour
 def get_screened_tickers():
     tickers = {}
     
-    # 1. Fetching the FTSE 100/350 via an alternate reliable source
+    # 1. Fetching Core FTSE Components from GitHub Data Feed
     try:
-        # Pulling directly from a clean financial data repo
         url = "https://raw.githubusercontent.com/datasets/ftse-100/master/data/ftse-100-components.csv"
         ftse_df = pd.read_csv(url)
         for t in ftse_df['Ticker'].dropna().tolist():
             clean_ticker = str(t).strip().replace('.', '-')
-            yahoo_ticker = f"{clean_ticker}.L"
+            if not clean_ticker.endswith(".L"):
+                yahoo_ticker = f"{clean_ticker}.L"
+            else:
+                yahoo_ticker = clean_ticker
             tickers[yahoo_ticker] = f"{clean_ticker} (FTSE Core)"
     except Exception as e:
-        st.sidebar.warning("Could not auto-load live LSE tracker. Using core fallbacks.")
+        st.sidebar.warning("Live LSE tracker feed down, using backups.")
 
-    # 2. Fetching Yahoo Undervalued Growth Assets using the correct yf.screen function
+    # 2. Fetching Yahoo Undervalued Growth Assets
     try:
         undervalued = yf.screen("undervalued_growth_stocks")
         if undervalued and 'quotes' in undervalued:
-            for quote in undervalued['quotes'][:15]: # Top 15 tickers
+            for quote in undervalued['quotes'][:15]: # Grab top 15
                 symbol = quote['symbol']
                 if symbol not in tickers:
                     tickers[symbol] = f"{symbol} (Yahoo Undervalued)"
     except Exception as e:
-        st.sidebar.warning("Could not auto-load Yahoo Undervalued. Using fallbacks.")
+        st.sidebar.warning("Yahoo Screeners currently throttled, using backups.")
         
-    # 3. ABSOLUTE HARD FALLBACK (Guarantees the app never starts empty)
+    # 3. Dynamic Fallback list to ensure stocks always show up
     fallback_defaults = {
         "AZN.L": "AstraZeneca (LSE)",
         "BP.L": "BP (LSE)",
         "LLOY.L": "Lloyds Banking Group (LSE)",
         "VOD.L": "Vodafone (LSE)",
-        "SMCI": "Super Micro (US - FX)",
-        "T": "AT&T (US - FX)",
-        "CCL": "Carnival (US - FX)"
+        "SMCI": "Super Micro (US)",
+        "T": "AT&T (US)",
+        "CCL": "Carnival (US)"
     }
     for k, v in fallback_defaults.items():
         if k not in tickers:
@@ -48,77 +50,61 @@ def get_screened_tickers():
             
     return tickers
 
-st.write("🔄 Fetching live constituent lists & processing indicators...")
+st.write("🔄 Extracting metrics and computing Exponential Moving Averages...")
 
 TICKERS = get_screened_tickers()
-ticker_list = list(TICKERS.keys())
+results = []
 
-try:
-    # Mass download to stay under Yahoo's rate limits safely
-    raw_data = yf.download(ticker_list, period="6m", group_by='ticker', progress=False)
+# Fetch using Tickers container to preserve individual data structures perfectly
+tickers_container = yf.Tickers(list(TICKERS.keys()))
+
+for symbol, name in TICKERS.items():
+    try:
+        # Request 6 months of historical context for this precise ticker object
+        data = tickers_container.tickers[symbol].history(period="6m")
+        
+        if data.empty or len(data) < 26:
+            continue
+            
+        # Calculate Technical Moving Averages
+        data['EMA12'] = data['Close'].ewm(span=12, adjust=False).mean()
+        data['EMA26'] = data['Close'].ewm(span=26, adjust=False).mean()
+        
+        latest = data.iloc[-1]
+        prev = data.iloc[-2]
+        
+        # Trend Analysis
+        if latest['EMA12'] > latest['EMA26'] and prev['EMA12'] <= prev['EMA26']:
+            signal = "🚀 BUY"
+        elif latest['EMA12'] < latest['EMA26'] and prev['EMA12'] >= prev['EMA26']:
+            signal = "🚨 SELL"
+        else:
+            signal = "😴 HOLD"
+            
+        is_foreign = not symbol.endswith(".L")
+        fx_penalty = "0.30% Roundtrip" if is_foreign else "0.00% (Native)"
+        
+        results.append({
+            "Stock": name,
+            "Symbol": symbol,
+            "Price": round(float(latest['Close']), 2),
+            "Signal": signal,
+            "T212 FX Cost": fx_penalty,
+            "Foreign": is_foreign
+        })
+    except:
+        continue # Ignore broken symbols or tickers suspended from trading
+
+# Render interface output structures
+if results:
+    df = pd.DataFrame(results)
+    st.success(f"Successfully processed {len(df)} assets!")
     
-    results = []
-    
-    # Ensure raw_data is not completely empty
-    if not raw_data.empty:
-        for symbol in ticker_list:
-            try:
-                # Defensive Multi-Index check
-                if isinstance(raw_data.columns, pd.MultiIndex):
-                    if symbol in raw_data.columns.levels[0]:
-                        data = raw_data[symbol].dropna()
-                    else:
-                        continue
-                else:
-                    data = raw_data.dropna()
-                    
-                if len(data) < 26:
-                    continue
-                    
-                # Indicators
-                data['EMA12'] = data['Close'].ewm(span=12, adjust=False).mean()
-                data['EMA26'] = data['Close'].ewm(span=26, adjust=False).mean()
-                
-                latest = data.iloc[-1]
-                prev = data.iloc[-2]
-                
-                # Signal Generation
-                if latest['EMA12'] > latest['EMA26'] and prev['EMA12'] <= prev['EMA26']:
-                    signal = "🚀 BUY"
-                elif latest['EMA12'] < latest['EMA26'] and prev['EMA12'] >= prev['EMA26']:
-                    signal = "🚨 SELL"
-                else:
-                    signal = "😴 HOLD"
-                    
-                is_foreign = not symbol.endswith(".L")
-                fx_penalty = "0.30% Roundtrip" if is_foreign else "0.00% (Native)"
-                
-                results.append({
-                    "Stock": TICKERS[symbol],
-                    "Symbol": symbol,
-                    "Price": round(float(latest['Close']), 2),
-                    "Signal": signal,
-                    "T212 FX Cost": fx_penalty,
-                    "Foreign": is_foreign
-                })
-            except:
-                continue
-
-    # Turn results safely into a DataFrame
-    if len(results) > 0:
-        df = pd.DataFrame(results)
-    else:
-        # Empty placeholder if absolutely everything failed to compute
-        df = pd.DataFrame(columns=["Stock", "Symbol", "Price", "Signal", "T212 FX Cost", "Foreign"])
-
-    st.success("Analysis Complete!")
-
-    # Tab Display System
     tab1, tab2, tab3 = st.tabs(["🚀 BUY Signals", "🚨 SELL Signals", "😴 ALL Positions"])
     
     with tab1:
         buys = df[df['Signal'] == "🚀 BUY"]
-        st.write(f"Found {len(buys)} active BUY recommendations")
+        st.write(f"Found {len(buys)} matching entries")
         for _, row in buys.iterrows():
             with st.expander(f"{row['Stock']} ({row['Symbol']})"):
                 st.metric("Price", f"{row['Price']}")
@@ -126,17 +112,13 @@ try:
                 
     with tab2:
         sells = df[df['Signal'] == "🚨 SELL"]
-        st.write(f"Found {len(sells)} active SELL recommendations")
+        st.write(f"Found {len(sells)} matching entries")
         for _, row in sells.iterrows():
             with st.expander(f"{row['Stock']} ({row['Symbol']})"):
                 st.metric("Price", f"{row['Price']}")
                 st.caption(f"T212 FX Fee Status: {row['T212 FX Cost']}")
                 
     with tab3:
-        if not df.empty:
-            st.dataframe(df[['Stock', 'Symbol', 'Price', 'Signal', 'T212 FX Cost']], use_container_width=True)
-        else:
-            st.info("No market data currently tracked.")
-
-except Exception as e:
-    st.error(f"Screener processing failure: {e}")
+        st.dataframe(df[['Stock', 'Symbol', 'Price', 'Signal', 'T212 FX Cost']], use_container_width=True)
+else:
+    st.error("Data tracking pipeline encountered an unexpected sync failure. Refresh page.")
